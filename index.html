@@ -421,11 +421,37 @@ Language: Korean preferred, English medical terms are fine.
 Be concise and direct. Skip generic "consult your doctor" disclaimers — the user IS the doctor. But clearly flag when evidence is limited, when you are uncertain, or when guidelines conflict.
 Answer only what is asked. Do not add unrequested considerations (e.g. do not mention CRRT, renal adjustment, or special populations unless the user asks).`;
 
-const MODELS = [
-  { id: 'claude-sonnet-4-20250514', label: 'Sonnet 4', costIn: 3, costOut: 15 },
+// Fallback model list (used until /v1/models loads, or if it fails)
+const FALLBACK_MODELS = [
+  { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6', costIn: 3, costOut: 15 },
   { id: 'claude-opus-4-8', label: 'Opus 4.8', costIn: 5, costOut: 25 },
   { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5', costIn: 1, costOut: 5 },
 ];
+
+// Estimate pricing from model id (the API doesn't return prices)
+function estimatePricing(id) {
+  if (id.includes('opus')) return { costIn: 5, costOut: 25 };
+  if (id.includes('haiku')) return { costIn: 1, costOut: 5 };
+  return { costIn: 3, costOut: 15 }; // sonnet / default
+}
+
+// Turn an API model entry into our shape
+function normalizeModel(m) {
+  const id = m.id;
+  // Prefer the human label the API gives, else derive from id
+  let label = m.display_name || id;
+  return { id, label, ...estimatePricing(id) };
+}
+
+// Sort: opus → sonnet → haiku, newest first within tier
+function sortModels(list) {
+  const tier = (id) => id.includes('opus') ? 0 : id.includes('sonnet') ? 1 : id.includes('haiku') ? 2 : 3;
+  return [...list].sort((a, b) => {
+    const t = tier(a.id) - tier(b.id);
+    if (t !== 0) return t;
+    return b.id.localeCompare(a.id); // newer version strings sort later → reverse
+  });
+}
 
 function renderMarkdown(text) {
   const html = marked.parse(text, { breaks: true, gfm: true });
@@ -477,7 +503,8 @@ function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [confirmDel, setConfirmDel] = useState(null);
   const [apiKey, setApiKey] = useState(() => localStorage.getItem('cq_api_key') || '');
-  const [model, setModel] = useState(() => localStorage.getItem('cq_model') || MODELS[0].id);
+  const [models, setModels] = useState(FALLBACK_MODELS);
+  const [model, setModel] = useState(() => localStorage.getItem('cq_model') || FALLBACK_MODELS[0].id);
   const [tokenCount, setTokenCount] = useState({ input: 0, output: 0 });
   const messagesRef = useRef(null);
   const textareaRef = useRef(null);
@@ -490,6 +517,39 @@ function App() {
 
   useEffect(() => { scrollToBottom(); }, [messages, loading, scrollToBottom]);
   useEffect(() => { if (!apiKey) setShowSettings(true); }, []);
+
+  // Fetch available models from the API whenever the key changes
+  useEffect(() => {
+    if (!apiKey) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch('https://api.anthropic.com/v1/models?limit=100', {
+          headers: {
+            'x-api-key': apiKey,
+            'anthropic-version': '2023-06-01',
+            'anthropic-dangerous-direct-browser-access': 'true',
+          },
+        });
+        if (!res.ok) return; // keep fallback list silently
+        const data = await res.json();
+        if (cancelled || !data.data) return;
+        // Only chat models (skip anything without "claude" in id)
+        const list = sortModels(
+          data.data.filter(m => m.id.includes('claude')).map(normalizeModel)
+        );
+        if (list.length > 0) {
+          setModels(list);
+          // If current model no longer exists, fall back to first available
+          if (!list.some(m => m.id === model)) {
+            setModel(list[0].id);
+            localStorage.setItem('cq_model', list[0].id);
+          }
+        }
+      } catch { /* keep fallback */ }
+    })();
+    return () => { cancelled = true; };
+  }, [apiKey]);
 
   // Auto-save on message change
   useEffect(() => {
@@ -619,7 +679,7 @@ function App() {
     setShowSettings(true);
   };
 
-  const currentModel = MODELS.find(m => m.id === model) || MODELS[0];
+  const currentModel = models.find(m => m.id === model) || models[0] || FALLBACK_MODELS[0];
   const estCost = (
     (tokenCount.input / 1e6) * currentModel.costIn +
     (tokenCount.output / 1e6) * currentModel.costOut
@@ -652,7 +712,7 @@ function App() {
                 <div className="chat-item-date">
                   {formatDate(chat.updatedAt)}
                   <span className="chat-item-model">
-                    {(MODELS.find(m => m.id === chat.model) || MODELS[0]).label}
+                    {(models.find(m => m.id === chat.model) || { label: chat.model }).label}
                   </span>
                 </div>
               </div>
@@ -754,7 +814,7 @@ function App() {
               <label className="field-label">Model</label>
               <select className="model-select" defaultValue={model}
                 onChange={e => tempModelRef.current = e.target.value}>
-                {MODELS.map(m => (
+                {models.map(m => (
                   <option key={m.id} value={m.id}>{m.label} — ${m.costIn}/${m.costOut} per M tokens</option>
                 ))}
               </select>
