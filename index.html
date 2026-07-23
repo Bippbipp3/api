@@ -305,6 +305,15 @@
   }
   .input-row textarea:focus { border-color: var(--accent-dim); }
   .input-row textarea::placeholder { color: var(--text-muted); }
+  .attach-btn {
+    width: 42px; height: 42px; border-radius: 10px;
+    border: 1px solid var(--border); background: var(--bg);
+    color: var(--text-dim); cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0; transition: all 0.15s;
+  }
+  .attach-btn:hover { border-color: var(--text-muted); color: var(--text); }
+  .attach-btn svg { width: 18px; height: 18px; }
   .send-btn {
     width: 42px; height: 42px; border-radius: 10px; border: none;
     background: var(--accent); color: var(--bg); cursor: pointer;
@@ -316,6 +325,58 @@
   .token-info {
     font-size: 11px; color: var(--text-muted); margin-top: 6px;
     text-align: right; font-family: var(--mono);
+  }
+
+  /* ── Attachment previews (composing) ── */
+  .attach-preview-row {
+    display: flex; gap: 8px; flex-wrap: wrap;
+    margin-bottom: 8px;
+  }
+  .attach-chip {
+    display: flex; align-items: center; gap: 6px;
+    background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 5px 8px 5px 6px;
+    font-size: 12px; color: var(--text-dim);
+    max-width: 200px;
+  }
+  .attach-chip img {
+    width: 22px; height: 22px; object-fit: cover;
+    border-radius: 4px; flex-shrink: 0;
+  }
+  .attach-chip .attach-icon {
+    width: 22px; height: 22px; border-radius: 4px; flex-shrink: 0;
+    background: var(--accent-dim); color: var(--accent);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 10px; font-weight: 700; font-family: var(--mono);
+  }
+  .attach-chip-name {
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .attach-chip-remove {
+    background: none; border: none; color: var(--text-muted);
+    cursor: pointer; font-size: 13px; padding: 0 2px; flex-shrink: 0;
+  }
+  .attach-chip-remove:hover { color: var(--error); }
+  .attach-warning {
+    font-size: 11px; color: var(--error);
+    margin-bottom: 6px;
+  }
+
+  /* ── Attachments inside sent messages ── */
+  .msg-attachments {
+    display: flex; gap: 6px; flex-wrap: wrap;
+    margin-bottom: 6px;
+  }
+  .msg-attachments img {
+    max-width: 160px; max-height: 160px;
+    border-radius: 8px; border: 1px solid rgba(255,255,255,0.1);
+    display: block;
+  }
+  .msg-attachment-file {
+    display: flex; align-items: center; gap: 6px;
+    background: rgba(0,0,0,0.15); border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 8px; padding: 6px 10px;
+    font-size: 12px; color: inherit; opacity: 0.85;
   }
 
   /* ── Modal ── */
@@ -489,7 +550,87 @@ function deleteChatData(id) { localStorage.removeItem(PFX + id); }
 function getTitle(msgs) {
   const first = msgs.find(m => m.role === 'user');
   if (!first) return '새 대화';
-  return first.content.length > 40 ? first.content.slice(0, 40) + '…' : first.content;
+  const text = typeof first.content === 'string'
+    ? first.content
+    : (first.content.find(b => b.type === 'text')?.text || '첨부파일');
+  return text.length > 40 ? text.slice(0, 40) + '…' : text;
+}
+
+const MAX_IMAGE_MB = 5;
+const MAX_PDF_MB = 20;
+
+function readFileAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result.split(',')[1]);
+    reader.onerror = () => reject(new Error('파일을 읽을 수 없습니다'));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function fileToAttachment(file) {
+  const isPdf = file.type === 'application/pdf';
+  const isImage = file.type.startsWith('image/');
+  if (!isPdf && !isImage) throw new Error('이미지 또는 PDF 파일만 지원됩니다');
+
+  const maxMB = isPdf ? MAX_PDF_MB : MAX_IMAGE_MB;
+  if (file.size > maxMB * 1024 * 1024) {
+    throw new Error(`${file.name}: ${maxMB}MB를 초과합니다`);
+  }
+
+  const base64 = await readFileAsBase64(file);
+  return {
+    id: genId(),
+    name: file.name,
+    kind: isPdf ? 'pdf' : 'image',
+    mediaType: file.type,
+    base64,
+    sizeKB: Math.round(file.size / 1024),
+  };
+}
+
+// Build content blocks from text + attachments (kept in app state, includes `name` for display)
+function buildContentBlocks(text, attachments) {
+  const blocks = [];
+  attachments.forEach(a => {
+    if (a.kind === 'image') {
+      blocks.push({ type: 'image', name: a.name, source: { type: 'base64', media_type: a.mediaType, data: a.base64 } });
+    } else {
+      blocks.push({ type: 'document', name: a.name, source: { type: 'base64', media_type: 'application/pdf', data: a.base64 } });
+    }
+  });
+  if (text) blocks.push({ type: 'text', text });
+  return blocks;
+}
+
+// Remove display-only fields (like `name`) before sending to the API
+function sanitizeContentForApi(content) {
+  if (typeof content === 'string') return content;
+  return content.map(b => {
+    if (b.type === 'image' || b.type === 'document') return { type: b.type, source: b.source };
+    return b;
+  });
+}
+
+
+// Extract plain text from a message's content (string or block array)
+function extractText(content) {
+  if (typeof content === 'string') return content;
+  const t = content.find(b => b.type === 'text');
+  return t ? t.text : '';
+}
+
+// Strip base64 payloads before saving to localStorage — keep only filenames as text
+function stripForStorage(messages) {
+  return messages.map(m => {
+    if (typeof m.content === 'string') return m;
+    const text = extractText(m.content);
+    const names = m.content
+      .filter(b => b.type === 'image' || b.type === 'document')
+      .map(b => b.name || (b.type === 'image' ? '이미지' : 'PDF'));
+    const combined = [text, names.length ? `[첨부: ${names.join(', ')}]` : ''].filter(Boolean).join('\n');
+    return { role: m.role, content: combined };
+  });
 }
 
 // ── App ──
@@ -498,6 +639,8 @@ function App() {
   const [activeId, setActiveId] = useState(null);
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
+  const [attachments, setAttachments] = useState([]);
+  const [attachError, setAttachError] = useState('');
   const [loading, setLoading] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -508,6 +651,7 @@ function App() {
   const [tokenCount, setTokenCount] = useState({ input: 0, output: 0 });
   const messagesRef = useRef(null);
   const textareaRef = useRef(null);
+  const fileInputRef = useRef(null);
   const tempKeyRef = useRef('');
   const tempModelRef = useRef('');
 
@@ -551,11 +695,16 @@ function App() {
     return () => { cancelled = true; };
   }, [apiKey]);
 
-  // Auto-save on message change
+  // Auto-save on message change (attachments' base64 stripped before storage)
   useEffect(() => {
     if (!activeId || messages.length === 0) return;
     const now = Date.now();
-    saveChatData(activeId, { messages, model, updatedAt: now });
+    const lightMessages = stripForStorage(messages);
+    try {
+      saveChatData(activeId, { messages: lightMessages, model, updatedAt: now });
+    } catch (e) {
+      // localStorage full — skip saving this turn silently
+    }
     setIndex(prev => {
       const updated = prev.map(c =>
         c.id === activeId ? { ...c, title: getTitle(messages), updatedAt: now, model } : c
@@ -608,24 +757,46 @@ function App() {
     el.style.height = Math.min(el.scrollHeight, 160) + 'px';
   };
 
+  const handleFileSelect = async (e) => {
+    const files = Array.from(e.target.files || []);
+    e.target.value = ''; // allow re-selecting the same file later
+    if (files.length === 0) return;
+    setAttachError('');
+    for (const file of files) {
+      try {
+        const att = await fileToAttachment(file);
+        setAttachments(prev => [...prev, att]);
+      } catch (err) {
+        setAttachError(err.message);
+      }
+    }
+  };
+
+  const removeAttachment = (id) => {
+    setAttachments(prev => prev.filter(a => a.id !== id));
+  };
+
   const handleSend = async () => {
     const text = input.trim();
-    if (!text || loading || !apiKey) return;
+    if ((!text && attachments.length === 0) || loading || !apiKey) return;
 
     let chatId = activeId;
-    if (!chatId) chatId = createChat(text);
+    if (!chatId) chatId = createChat(text || getTitle([{ role: 'user', content: buildContentBlocks(text, attachments) }]));
 
-    const userMsg = { role: 'user', content: text };
+    const content = attachments.length > 0 ? buildContentBlocks(text, attachments) : text;
+    const userMsg = { role: 'user', content };
     const newMessages = [...messages, userMsg];
     setMessages(newMessages);
     setInput('');
+    setAttachments([]);
+    setAttachError('');
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
     setLoading(true);
 
     try {
       const apiMessages = newMessages
         .filter(m => m.role !== 'error')
-        .map(m => ({ role: m.role, content: m.content }));
+        .map(m => ({ role: m.role, content: sanitizeContentForApi(m.content) }));
 
       const res = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
@@ -764,19 +935,62 @@ function App() {
           </div>
         ) : (
           <div className="messages" ref={messagesRef}>
-            {messages.map((msg, i) => (
-              <div key={i} className={`msg ${msg.role}`}>
-                {msg.role === 'assistant' ? (
-                  <div dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }} />
-                ) : msg.content}
-              </div>
-            ))}
+            {messages.map((msg, i) => {
+              const isArray = Array.isArray(msg.content);
+              const textPart = isArray ? extractText(msg.content) : msg.content;
+              const fileBlocks = isArray ? msg.content.filter(b => b.type === 'image' || b.type === 'document') : [];
+              return (
+                <div key={i} className={`msg ${msg.role}`}>
+                  {fileBlocks.length > 0 && (
+                    <div className="msg-attachments">
+                      {fileBlocks.map((b, j) => b.type === 'image' ? (
+                        <img key={j} src={`data:${b.source.media_type};base64,${b.source.data}`} alt={b.name || 'image'} />
+                      ) : (
+                        <div key={j} className="msg-attachment-file">📄 {b.name || 'PDF'}</div>
+                      ))}
+                    </div>
+                  )}
+                  {msg.role === 'assistant' ? (
+                    <div dangerouslySetInnerHTML={{ __html: renderMarkdown(textPart) }} />
+                  ) : textPart}
+                </div>
+              );
+            })}
             {loading && <div className="typing"><span /><span /><span /></div>}
           </div>
         )}
 
         <div className="input-area">
+          {attachments.length > 0 && (
+            <div className="attach-preview-row">
+              {attachments.map(a => (
+                <div key={a.id} className="attach-chip">
+                  {a.kind === 'image' ? (
+                    <img src={`data:${a.mediaType};base64,${a.base64}`} alt={a.name} />
+                  ) : (
+                    <div className="attach-icon">PDF</div>
+                  )}
+                  <span className="attach-chip-name">{a.name}</span>
+                  <button className="attach-chip-remove" onClick={() => removeAttachment(a.id)}>✕</button>
+                </div>
+              ))}
+            </div>
+          )}
+          {attachError && <div className="attach-warning">{attachError}</div>}
           <div className="input-row">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*,application/pdf"
+              multiple
+              style={{ display: 'none' }}
+              onChange={handleFileSelect}
+            />
+            <button className="attach-btn" onClick={() => fileInputRef.current?.click()} disabled={loading} title="파일 첨부">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+              </svg>
+            </button>
             <textarea
               ref={textareaRef} rows={1} value={input}
               onChange={e => { setInput(e.target.value); autoResize(e.target); }}
@@ -784,7 +998,7 @@ function App() {
               placeholder="질문을 입력하세요..."
               disabled={loading}
             />
-            <button className="send-btn" onClick={handleSend} disabled={!input.trim() || loading || !apiKey}>
+            <button className="send-btn" onClick={handleSend} disabled={(!input.trim() && attachments.length === 0) || loading || !apiKey}>
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
                 <line x1="22" y1="2" x2="11" y2="13" />
                 <polygon points="22 2 15 22 11 13 2 9 22 2" />
